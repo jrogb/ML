@@ -1,3 +1,7 @@
 Color Detection/.venv-colorDetection
+Facial Recognition/.venv-facialRecognition
 .gitignore
 ML.code-workspace
+Color Detection/__pycache__
+Facial Recognition/__pycache__
+Facial Recognition/data

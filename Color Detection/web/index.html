@@ -1,0 +1,235 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Color Detection</title>
+  <style>
+    body { margin: 0; font-family: system-ui, sans-serif; background: #111; color: #eee;
+           display: flex; flex-direction: column; align-items: center; gap: 12px; padding: 16px; }
+    .controls { display: flex; gap: 12px; align-items: center; flex-wrap: wrap; }
+    canvas { max-width: 100%; border-radius: 6px; background: #000; }
+    button { padding: 6px 14px; font-size: 1rem; cursor: pointer; }
+    #status { font-size: 0.9rem; color: #aaa; }
+  </style>
+</head>
+<body>
+  <h1>Color Detection</h1>
+  <div class="controls">
+    <button id="toggle">Start webcam</button>
+    <label>Color <input type="color" id="color" value="#ffff00"></label>
+    <label><input type="checkbox" id="showMask"> Show mask</label>
+  </div>
+  <div class="controls">
+    <label><input type="checkbox" id="enableColor" checked> Color</label>
+    <label><input type="checkbox" id="enableQr" checked> QR codes</label>
+    <label><input type="checkbox" id="enableFaces" checked> Faces</label>
+  </div>
+  <canvas id="output" width="640" height="480"></canvas>
+  <div id="status">Click "Start webcam" to begin.</div>
+
+  <video id="video" playsinline muted hidden></video>
+
+  <script src="https://cdn.jsdelivr.net/npm/jsqr@1.4.0/dist/jsQR.min.js"></script>
+  <script type="module">
+    import { FilesetResolver, FaceDetector }
+      from 'https://cdn.jsdelivr.net/npm/@mediapipe/tasks-vision@0.10.14/vision_bundle.mjs';
+
+    const video = document.getElementById('video');
+    const canvas = document.getElementById('output');
+    const ctx = canvas.getContext('2d', { willReadFrequently: true });
+    const toggleBtn = document.getElementById('toggle');
+    const colorInput = document.getElementById('color');
+    const showMaskInput = document.getElementById('showMask');
+    const statusEl = document.getElementById('status');
+    const enableColor = document.getElementById('enableColor');
+    const enableQr = document.getElementById('enableQr');
+    const enableFaces = document.getElementById('enableFaces');
+
+    let stream = null;
+    let running = false;
+    let faceDetector = null;
+    let faceDetectorLoading = null;
+    let faceDetectorError = null;
+
+    // Loads MediaPipe's BlazeFace model once, on first use
+    function loadFaceDetector() {
+      if (!faceDetectorLoading) {
+        faceDetectorLoading = (async () => {
+          const vision = await FilesetResolver.forVisionTasks(
+            'https://cdn.jsdelivr.net/npm/@mediapipe/tasks-vision@0.10.14/wasm');
+          faceDetector = await FaceDetector.createFromOptions(vision, {
+            baseOptions: {
+              modelAssetPath: 'https://storage.googleapis.com/mediapipe-models/face_detector/blaze_face_short_range/float16/1/blaze_face_short_range.tflite',
+            },
+            runningMode: 'VIDEO',
+            minDetectionConfidence: 0.5,
+          });
+        })().catch(err => {
+          faceDetectorError = err.message;
+        });
+      }
+      return faceDetectorLoading;
+    }
+
+    function drawLabel(text, x, y, color) {
+      ctx.font = '16px system-ui, sans-serif';
+      const w = ctx.measureText(text).width + 8;
+      const ty = Math.max(y - 22, 0);
+      ctx.fillStyle = color;
+      ctx.fillRect(x, ty, w, 22);
+      ctx.fillStyle = '#000';
+      ctx.fillText(text, x + 4, ty + 16);
+    }
+
+    // RGB (0-255) -> HSV using OpenCV's 8-bit ranges: H 0-179, S 0-255, V 0-255
+    function rgbToHsv(r, g, b) {
+      const max = Math.max(r, g, b);
+      const min = Math.min(r, g, b);
+      const diff = max - min;
+      const v = max;
+      const s = max === 0 ? 0 : (diff * 255) / max;
+      let h = 0;
+      if (diff !== 0) {
+        if (max === r) h = (60 * (g - b)) / diff;
+        else if (max === g) h = 120 + (60 * (b - r)) / diff;
+        else h = 240 + (60 * (r - g)) / diff;
+        if (h < 0) h += 360;
+      }
+      return [h / 2, s, v];
+    }
+
+    // Equivalent of util.get_limits: hue ±10, saturation and value 100-255
+    function getLimits(hexColor) {
+      const r = parseInt(hexColor.slice(1, 3), 16);
+      const g = parseInt(hexColor.slice(3, 5), 16);
+      const b = parseInt(hexColor.slice(5, 7), 16);
+      const [h] = rgbToHsv(r, g, b);
+      return { hue: h, hueRange: 10, minS: 100, minV: 100 };
+    }
+
+    // Equivalent of cv2.inRange + PIL getbbox: returns [x1, y1, x2, y2] or null
+    function detect(imageData, limits, drawMask) {
+      const { data, width, height } = imageData;
+      let x1 = width, y1 = height, x2 = -1, y2 = -1;
+
+      for (let y = 0; y < height; y++) {
+        for (let x = 0; x < width; x++) {
+          const i = (y * width + x) * 4;
+          const [h, s, v] = rgbToHsv(data[i], data[i + 1], data[i + 2]);
+
+          // Hue is circular (0-179), so compare the wrapped distance
+          let dh = Math.abs(h - limits.hue);
+          if (dh > 90) dh = 180 - dh;
+          const inRange = dh <= limits.hueRange && s >= limits.minS && v >= limits.minV;
+
+          if (inRange) {
+            if (x < x1) x1 = x;
+            if (x > x2) x2 = x;
+            if (y < y1) y1 = y;
+            if (y > y2) y2 = y;
+          }
+          if (drawMask) {
+            const m = inRange ? 255 : 0;
+            data[i] = data[i + 1] = data[i + 2] = m;
+          }
+        }
+      }
+      return x2 < 0 ? null : [x1, y1, x2 + 1, y2 + 1];
+    }
+
+    function loop() {
+      if (!running) return;
+      if (video.readyState >= 2) {
+        ctx.drawImage(video, 0, 0, canvas.width, canvas.height);
+        const frame = ctx.getImageData(0, 0, canvas.width, canvas.height);
+        const results = [];
+
+        // QR runs first, on the untouched frame (the mask view overwrites pixels)
+        let qr = null;
+        if (enableQr.checked) {
+          qr = jsQR(frame.data, frame.width, frame.height, { inversionAttempts: 'dontInvert' });
+        }
+
+        if (enableColor.checked) {
+          const drawMask = showMaskInput.checked;
+          const bbox = detect(frame, getLimits(colorInput.value), drawMask);
+          if (drawMask) ctx.putImageData(frame, 0, 0);
+
+          if (bbox) {
+            const [x1, y1, x2, y2] = bbox;
+            ctx.strokeStyle = 'rgb(0, 255, 0)';
+            ctx.lineWidth = 3;
+            ctx.strokeRect(x1, y1, x2 - x1, y2 - y1);
+            results.push('color found');
+          }
+        }
+
+        if (qr) {
+          const { topLeftCorner: a, topRightCorner: b, bottomRightCorner: c, bottomLeftCorner: d } = qr.location;
+          ctx.strokeStyle = 'rgb(0, 160, 255)';
+          ctx.lineWidth = 3;
+          ctx.beginPath();
+          ctx.moveTo(a.x, a.y);
+          ctx.lineTo(b.x, b.y);
+          ctx.lineTo(c.x, c.y);
+          ctx.lineTo(d.x, d.y);
+          ctx.closePath();
+          ctx.stroke();
+          const text = qr.data.length > 40 ? qr.data.slice(0, 40) + '…' : qr.data;
+          drawLabel(`QR: ${text}`, Math.min(a.x, d.x), Math.min(a.y, b.y), 'rgb(0, 160, 255)');
+          results.push(`QR: ${qr.data}`);
+        }
+
+        if (enableFaces.checked) {
+          if (faceDetector) {
+            const { detections } = faceDetector.detectForVideo(video, performance.now());
+            for (const det of detections) {
+              const { originX, originY, width, height } = det.boundingBox;
+              ctx.strokeStyle = 'rgb(255, 80, 80)';
+              ctx.lineWidth = 3;
+              ctx.strokeRect(originX, originY, width, height);
+              const score = Math.round(det.categories[0].score * 100);
+              drawLabel(`Face ${score}%`, originX, originY, 'rgb(255, 80, 80)');
+            }
+            if (detections.length) results.push(`${detections.length} face(s)`);
+          } else if (faceDetectorError) {
+            results.push(`face model failed to load: ${faceDetectorError}`);
+          } else {
+            loadFaceDetector();
+            results.push('loading face model…');
+          }
+        }
+
+        statusEl.textContent = results.length ? results.join(' · ') : 'Nothing detected.';
+      }
+      requestAnimationFrame(loop);
+    }
+
+    async function start() {
+      try {
+        stream = await navigator.mediaDevices.getUserMedia({ video: { width: 640, height: 480 } });
+      } catch (err) {
+        statusEl.textContent = `Could not open webcam: ${err.message}`;
+        return;
+      }
+      video.srcObject = stream;
+      await video.play();
+      canvas.width = video.videoWidth;
+      canvas.height = video.videoHeight;
+      running = true;
+      toggleBtn.textContent = 'Stop webcam';
+      if (enableFaces.checked) loadFaceDetector();
+      loop();
+    }
+
+    function stop() {
+      running = false;
+      stream?.getTracks().forEach(t => t.stop());
+      stream = null;
+      toggleBtn.textContent = 'Start webcam';
+      statusEl.textContent = 'Stopped.';
+    }
+
+    toggleBtn.addEventListener('click', () => (running ? stop() : start()));
+  </script>
